@@ -1,0 +1,13 @@
+---
+# Namespace for Fincra Flask Application
+# This namespace isolates the application resources and enables
+# the Fargate profile selector to schedule pods on Fargate
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: fincra-app
+  labels:
+    name: fincra-app
+    app.kubernetes.io/name: fincra-app
+    app.kubernetes.io/managed-by: kubectl
+    environment: production

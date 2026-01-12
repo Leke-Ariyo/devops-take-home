@@ -1,0 +1,29 @@
+---
+# Service for Fincra Flask Application
+# ClusterIP service that exposes the application within the cluster
+# The ALB Ingress Controller will create an ALB that routes traffic to this service
+apiVersion: v1
+kind: Service
+metadata:
+  name: fincra-flask-app
+  namespace: fincra-app
+  labels:
+    app: fincra-flask-app
+    app.kubernetes.io/name: fincra-flask-app
+    app.kubernetes.io/component: webserver
+  annotations:
+    # Health check configuration for target group
+    alb.ingress.kubernetes.io/healthcheck-path: /health
+    alb.ingress.kubernetes.io/healthcheck-port: "80"
+    alb.ingress.kubernetes.io/healthcheck-protocol: HTTP
+spec:
+  type: ClusterIP
+  selector:
+    app: fincra-flask-app
+  ports:
+    - name: http
+      protocol: TCP
+      port: 80
+      targetPort: 80
+  # Session affinity for sticky sessions (optional)
+  sessionAffinity: None

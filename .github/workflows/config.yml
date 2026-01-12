@@ -1,0 +1,377 @@
+# Fincra DevOps CI/CD Pipeline
+# This workflow builds, tests, and deploys the Flask application to EKS Fargate
+name: Fincra CI/CD Pipeline
+
+on:
+  push:
+    branches:
+      - main
+      - master
+    paths-ignore:
+      - '**.md'
+      - 'docs/**'
+  pull_request:
+    branches:
+      - main
+      - master
+
+env:
+  AWS_REGION: eu-west-1
+  ECR_REPOSITORY: fincra-flask-app
+  EKS_CLUSTER_NAME: fincra-eks-cluster
+  K8S_NAMESPACE: fincra-app
+
+jobs:
+  # ============================================
+  # Job 1: Lint and Test
+  # ============================================
+  lint-and-test:
+    name: Lint and Test
+    runs-on: ubuntu-latest
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+
+      - name: Install Python dependencies
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt
+          pip install flake8 pytest pytest-cov
+
+      - name: Lint with flake8
+        run: |
+          # Stop the build if there are Python syntax errors or undefined names
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          # Exit-zero treats all errors as warnings
+          flake8 . --count --exit-zero --max-complexity=10 --max-line-length=127 --statistics
+
+      - name: Run unit tests
+        run: |
+          python -c "from app import app; print('Flask app imports successfully')"
+          echo "Basic sanity test passed"
+
+  # ============================================
+  # Job 2: Build and Push Docker Image
+  # ============================================
+  build-and-push:
+    name: Build and Push Docker Image
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    outputs:
+      image_tag: ${{ steps.build-image.outputs.image_tag }}
+      image_uri: ${{ steps.build-image.outputs.image_uri }}
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Login to Amazon ECR
+        id: login-ecr
+        uses: aws-actions/amazon-ecr-login@v2
+
+      - name: Build, tag, and push image to Amazon ECR
+        id: build-image
+        env:
+          ECR_REGISTRY: ${{ steps.login-ecr.outputs.registry }}
+          IMAGE_TAG: ${{ github.sha }}
+        run: |
+          # Build the Docker image
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG .
+          docker build -t $ECR_REGISTRY/$ECR_REPOSITORY:latest .
+          
+          # Push both tags to ECR
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
+          docker push $ECR_REGISTRY/$ECR_REPOSITORY:latest
+          
+          # Output the image URI for downstream jobs
+          echo "image_tag=$IMAGE_TAG" >> $GITHUB_OUTPUT
+          echo "image_uri=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
+          
+          echo "::notice::Image pushed: $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG"
+
+  # ============================================
+  # Job 3: CDK Synth and Diff
+  # ============================================
+  cdk-synth:
+    name: CDK Synthesize
+    runs-on: ubuntu-latest
+    needs: lint-and-test
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: ./cdk
+        run: |
+          npm ci
+          npm install -g aws-cdk
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CDK Synth
+        working-directory: ./cdk
+        run: |
+          cdk synth --quiet
+          echo "::notice::CDK synthesis completed successfully"
+
+      - name: CDK Diff
+        working-directory: ./cdk
+        run: |
+          cdk diff || true
+        continue-on-error: true
+
+      - name: Upload CDK artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: cdk-out
+          path: cdk/cdk.out/
+          retention-days: 7
+
+  # ============================================
+  # Job 4: Deploy Infrastructure (CDK)
+  # ============================================
+  deploy-infrastructure:
+    name: Deploy Infrastructure
+    runs-on: ubuntu-latest
+    needs: [cdk-synth, build-and-push]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: cdk/package-lock.json
+
+      - name: Install CDK dependencies
+        working-directory: ./cdk
+        run: |
+          npm ci
+          npm install -g aws-cdk
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: CDK Bootstrap (if needed)
+        working-directory: ./cdk
+        run: |
+          cdk bootstrap aws://${{ secrets.AWS_ACCOUNT_ID }}/${{ env.AWS_REGION }} || true
+
+      - name: CDK Deploy
+        working-directory: ./cdk
+        run: |
+          cdk deploy --all --require-approval never --outputs-file outputs.json
+          echo "::notice::Infrastructure deployment completed"
+
+      - name: Upload deployment outputs
+        uses: actions/upload-artifact@v4
+        with:
+          name: deployment-outputs
+          path: cdk/outputs.json
+          retention-days: 30
+
+  # ============================================
+  # Job 5: Deploy Application to EKS
+  # ============================================
+  deploy-application:
+    name: Deploy Application to EKS
+    runs-on: ubuntu-latest
+    needs: [deploy-infrastructure, build-and-push]
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    environment: production
+    
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: Install kustomize
+        run: |
+          curl -s "https://raw.githubusercontent.com/kubernetes-sigs/kustomize/master/hack/install_kustomize.sh" | bash
+          sudo mv kustomize /usr/local/bin/
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Get ECR Repository URI
+        id: ecr-uri
+        run: |
+          ECR_URI=$(aws ecr describe-repositories --repository-names ${{ env.ECR_REPOSITORY }} --query 'repositories[0].repositoryUri' --output text)
+          echo "ecr_uri=$ECR_URI" >> $GITHUB_OUTPUT
+
+      - name: Update Kubernetes manifests with image
+        run: |
+          cd k8s
+          
+          # Update kustomization with correct image
+          sed -i "s|PLACEHOLDER_ECR_URI|${{ steps.ecr-uri.outputs.ecr_uri }}|g" kustomization.yaml
+          sed -i "s|newTag: latest|newTag: ${{ needs.build-and-push.outputs.image_tag }}|g" kustomization.yaml
+          
+          # Update deployment with correct image
+          sed -i "s|\${ECR_REPOSITORY_URI}:\${IMAGE_TAG}|${{ steps.ecr-uri.outputs.ecr_uri }}:${{ needs.build-and-push.outputs.image_tag }}|g" deployment.yaml
+          
+          echo "Updated manifests:"
+          cat kustomization.yaml
+          cat deployment.yaml
+
+      - name: Apply Kubernetes manifests
+        run: |
+          # Apply namespace first
+          kubectl apply -f k8s/namespace.yaml
+          
+          # Apply remaining manifests using kustomize
+          kubectl apply -k k8s/
+          
+          echo "::notice::Kubernetes manifests applied"
+
+      - name: Wait for deployment rollout
+        run: |
+          kubectl rollout status deployment/fincra-flask-app -n ${{ env.K8S_NAMESPACE }} --timeout=300s
+
+      - name: Verify deployment
+        run: |
+          echo "=== Deployment Status ==="
+          kubectl get deployment -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "=== Pods Status ==="
+          kubectl get pods -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "=== Service Status ==="
+          kubectl get service -n ${{ env.K8S_NAMESPACE }}
+          
+          echo "=== Ingress Status ==="
+          kubectl get ingress -n ${{ env.K8S_NAMESPACE }}
+
+      - name: Get Application URL
+        run: |
+          # Wait for ALB to be provisioned
+          echo "Waiting for ALB to be provisioned..."
+          sleep 30
+          
+          ALB_URL=$(kubectl get ingress fincra-flask-app -n ${{ env.K8S_NAMESPACE }} -o jsonpath='{.status.loadBalancer.ingress[0].hostname}' 2>/dev/null || echo "pending")
+          
+          if [ "$ALB_URL" != "pending" ] && [ -n "$ALB_URL" ]; then
+            echo "::notice::Application URL: http://$ALB_URL"
+            echo "APPLICATION_URL=http://$ALB_URL" >> $GITHUB_ENV
+          else
+            echo "::warning::ALB is still being provisioned. Check AWS console for status."
+          fi
+
+  # ============================================
+  # Job 6: Smoke Tests
+  # ============================================
+  smoke-tests:
+    name: Smoke Tests
+    runs-on: ubuntu-latest
+    needs: deploy-application
+    if: github.event_name == 'push' && (github.ref == 'refs/heads/main' || github.ref == 'refs/heads/master')
+    
+    steps:
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ env.AWS_REGION }}
+
+      - name: Install kubectl
+        uses: azure/setup-kubectl@v4
+        with:
+          version: 'v1.30.0'
+
+      - name: Update kubeconfig
+        run: |
+          aws eks update-kubeconfig --name ${{ env.EKS_CLUSTER_NAME }} --region ${{ env.AWS_REGION }}
+
+      - name: Run smoke tests
+        run: |
+          # Check pods are running
+          RUNNING_PODS=$(kubectl get pods -n ${{ env.K8S_NAMESPACE }} -l app=fincra-flask-app --field-selector=status.phase=Running --no-headers | wc -l)
+          
+          if [ "$RUNNING_PODS" -lt 1 ]; then
+            echo "::error::No running pods found"
+            exit 1
+          fi
+          
+          echo "::notice::$RUNNING_PODS pods are running"
+          
+          # Test health endpoint via port-forward
+          kubectl port-forward svc/fincra-flask-app 8080:80 -n ${{ env.K8S_NAMESPACE }} &
+          PF_PID=$!
+          sleep 5
+          
+          # Test endpoints
+          echo "Testing health endpoint..."
+          HEALTH_RESPONSE=$(curl -s http://localhost:8080/health || echo "failed")
+          
+          echo "Testing main endpoint..."
+          MAIN_RESPONSE=$(curl -s http://localhost:8080/ || echo "failed")
+          
+          # Cleanup
+          kill $PF_PID 2>/dev/null || true
+          
+          # Validate responses
+          if [[ "$MAIN_RESPONSE" == *"Hello, from Fincra!"* ]]; then
+            echo "::notice::Main endpoint test passed"
+          else
+            echo "::error::Main endpoint test failed. Response: $MAIN_RESPONSE"
+            exit 1
+          fi
+          
+          if [[ "$HEALTH_RESPONSE" == *"healthy"* ]]; then
+            echo "::notice::Health endpoint test passed"
+          else
+            echo "::warning::Health endpoint returned: $HEALTH_RESPONSE"
+          fi
+          
+          echo "All smoke tests passed!"

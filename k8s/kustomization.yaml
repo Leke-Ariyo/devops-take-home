@@ -1,0 +1,36 @@
+---
+# Kustomization file for Fincra Flask Application
+# Allows environment-specific overlays and image transformations
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+metadata:
+  name: fincra-flask-app
+
+# Namespace for all resources
+namespace: fincra-app
+
+# Common labels applied to all resources
+commonLabels:
+  app.kubernetes.io/name: fincra-flask-app
+  app.kubernetes.io/part-of: fincra-platform
+  app.kubernetes.io/managed-by: kustomize
+
+# Resources to include
+resources:
+  - namespace.yaml
+  - deployment.yaml
+  - service.yaml
+  - ingress.yaml
+
+# Image transformations - updated by CI/CD pipeline
+images:
+  - name: "${ECR_REPOSITORY_URI}:${IMAGE_TAG}"
+    newName: PLACEHOLDER_ECR_URI
+    newTag: latest
+
+# Config map generator (optional - for environment-specific configs)
+# configMapGenerator:
+#   - name: fincra-app-config
+#     literals:
+#       - FLASK_ENV=production
