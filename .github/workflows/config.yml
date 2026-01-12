@@ -125,7 +125,7 @@ jobs:
       - name: Install CDK dependencies
         working-directory: ./cdk
         run: |
-          npm ci
+          npm install
           npm install -g aws-cdk
 
       - name: Configure AWS credentials
@@ -178,7 +178,7 @@ jobs:
       - name: Install CDK dependencies
         working-directory: ./cdk
         run: |
-          npm ci
+          npm install
           npm install -g aws-cdk
 
       - name: Configure AWS credentials
